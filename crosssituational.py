@@ -1,12 +1,12 @@
 from collections import defaultdict
 from dataclasses import dataclass
 import random
-from copy import deepcopy
-import os
+import time
 import numpy as np
 from word2word import Word2word
 import matplotlib.pyplot as plt
-
+import tqdm
+import os
 
 @dataclass
 class BilingualDataset:
@@ -17,14 +17,18 @@ class BilingualDataset:
         with open(self.filename, 'r', encoding="utf-8") as f:
             self.lines = [line.split('\t')[:2] for line in f.readlines()]
 
+        random.seed(42)
         if self.shuffled:
             random.shuffle(self.lines)
 
         self.lines = [(self.preprocess(line[0]), self.preprocess(line[1])) for line in self.lines]
+
         self.source_words_total = sum([len(line[0].split()) for line in self.lines])
         self.target_words_total = sum([len(line[1].split()) for line in self.lines])
         self.source_unique_words = set([word for line in self.lines for word in line[0].split()])
         self.target_unique_words = set([word for line in self.lines for word in line[1].split()])
+
+        self.test_words_subset = random.sample(list(self.source_unique_words), len(self.source_unique_words) // 10)
 
         print(self)
 
@@ -47,17 +51,21 @@ class BilingualDataset:
 
 class CrossSituationalModel:
     def __init__(self, name, data: BilingualDataset):
+        os.makedirs("results", exist_ok=True)
+
         self.name = name
         self.en2nl = Word2word("en", "nl")
 
         self.data = data
-
         self.source_word_counts = defaultdict(int)
         self.target_word_counts = defaultdict(int)
+
+        self.source_unique_words = set()
+        self.target_unique_words = set()
         
         self.table = defaultdict(lambda: defaultdict(int))
-
-        self.translation_cache = {}
+        self.translations = defaultdict(str)
+        self.results = None
     
     def process_sentence_pair(self, pair: tuple[str, str]):
         source_sentence, target_sentence = pair
@@ -70,98 +78,99 @@ class CrossSituationalModel:
                 self.source_word_counts[source_word] += 1
                 self.target_word_counts[target_word] += 1
 
-        return len(source_words)
+        self.source_unique_words.update(source_words)
+        self.target_unique_words.update(target_words)
 
-    def get_most_likely_translation_old(self, source_word: str):
-        target_words = list(self.table[source_word].keys())
-        target_words_score = [self.table[source_word][word] / self.target_word_counts[word] for word in target_words]
-        target_words_confidence = [self.table[source_word][word] for word in target_words]
-        max_index = target_words_score.index(max(target_words_score))
-        return target_words[max_index], target_words_confidence[max_index] - 1
-
-    def get_most_likely_translation_bayes(self, source_word: str):
-        target_words = list(self.table[source_word].keys())
-
-        if not target_words:
-            return "", 0
-
+    def get_most_likely_translation(self, source_word: str):
+        target_words = np.array(list(self.table[source_word].keys()))
         smooth = 1
 
-        priors = [(self.table[source_word][word] + smooth) / (self.target_word_counts[word] + smooth * len(target_words)) for word in target_words]
-        likelihoods = [(self.table[source_word][word] + smooth) / (self.target_word_counts[word] + smooth * len(target_words)) for word in target_words]
+        if len(target_words) == 0:
+            return "", 0
 
-        # normalize
-        likelihoods = [likelihood / sum(likelihoods) for likelihood in likelihoods]
-        priors = [prior / sum(priors) for prior in priors]
+        table_counts = np.array([self.table[source_word][word] for word in target_words])
+        target_word_counts = np.array([self.target_word_counts[word] for word in target_words])
 
-        posteriors = [(likelihood * prior) / sum(np.array(likelihoods) * np.array(priors)) for likelihood, prior in zip(likelihoods, priors)]
+        probabilities = (table_counts + smooth) / (target_word_counts + smooth * len(target_words))
 
-        max_index = posteriors.index(max(posteriors))
-        return target_words[max_index], posteriors[max_index]
+        max_index = np.argmax(probabilities)
+        return target_words[max_index], probabilities[max_index]
 
     def train(self):
-        results = [(0, 0)]
-        words_processed = 0
-        update_interval = self.data.source_words_total // 10
+        results = [(0, 0, 0)]
 
-        for i, pair in enumerate(self.data):
-            words_processed += self.process_sentence_pair(pair)
+        for i, pair in tqdm.tqdm(enumerate(self.data), total=len(self.data)):
+            self.process_sentence_pair(pair)
 
-            if words_processed >= update_interval or i == len(self.data) - 1:
-                test_acc = self.test()
-                results.append((i, test_acc))
-                print(f"Test performance (i={i}): {test_acc}")
-                words_processed -= update_interval
+            if i % (len(self.data) // 100) == 0 and i != 0:
+                evaluation_results = self.test()
+                results.append((i, *evaluation_results))
+                tqdm.tqdm.write(f"Test performance (i={i}): {evaluation_results}") 
 
-        self.test_results = results
+        self.results = results
         return results
 
     def test(self):
-        translation_pairs = [(source_word, *self.get_most_likely_translation_bayes(source_word)) for source_word in self.data.source_unique_words]
-        results = self.evaluate_accuracy(translation_pairs)
-        return results
+        # get all words encountered before
+        encountered = set(self.source_word_counts.keys())
 
-    def evaluate_accuracy(self, translation_pairs: list[tuple[str, str, int]]):
+        translation_pairs = [(source_word, *self.get_most_likely_translation(source_word)) for source_word in encountered]
+        words_learned, accuracy = self.evaluate(translation_pairs)
+
+        return words_learned, accuracy
+
+    def evaluate(self, translation_pairs: list[tuple[str, str, int]]):
         correct = 0
+        wrong = 0
         missing = []
 
         for source_word, target_word, confidence in translation_pairs:
             try:
-                if source_word in self.translation_cache:
-                    translations = self.translation_cache[source_word]
-                else:
-                    translations = self.en2nl(source_word)
-                    self.translation_cache[source_word] = translations
-
+                translations = self.en2nl(source_word)
                 if target_word in translations:
                     correct += 1
+                else:
+                    wrong += 1
             except KeyError:
                 missing.append((source_word, target_word))
 
-        # if missing:
-        #     missing = sorted(missing, key=lambda x: x[0])
-        #     print(f"Missing {len(missing)} words from the test set (out of {len(translation_pairs)} words) written to file.")
-        #     with open("data/missing.txt", "w", encoding="utf-8") as f:
-        #         for source_word, target_word in missing:
-        #             sentences = [pair for pair in self.test_data if source_word in [self.preprocess(w) for w in pair[0].split()]]
-        #             f.write(f"{source_word} {target_word} {str(sentences)}\n")
-
-        if len(translation_pairs) == len(missing):
+        if correct + wrong == 0:
             return 0
 
-        return correct / (len(translation_pairs) - len(missing))
+        return correct, correct / (correct + wrong)
     
-    def plot_results(self):
-        x, y = zip(*self.test_results)
-        plt.plot(x, y)
-        plt.title(f"Performance over time ({self.name})")
-        plt.xlabel("Number of words processed")
-        plt.ylabel("Accuracy over all dataset words")
-        plt.show()
+    def plot_results(self, results_comparison=None):
+        x, words_learned, accuracy = zip(*self.results)
 
+        if results_comparison is not None:
+            _, words_learned_, accuracy_ = zip(*results_comparison)
+            words_learned = np.array(words_learned) / np.array(words_learned_)
+            accuracy = np.array(accuracy) - np.array(accuracy_)
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
+        ax1: plt.Axes
+        ax2: plt.Axes
+        ax1.plot(x, words_learned)
+        ax2.plot(x, accuracy)
+        ax2.set_xlabel("Number of words processed")
+
+        if results_comparison is None:
+            fig.suptitle(f"Results for {self.name}")
+            ax1.set_ylabel("Words learned")
+            ax1.set_ylim([0, len(self.data.source_unique_words)])
+            ax2.set_ylabel("Accuracy")
+            ax2.set_ylim([0, 1])
+        else:
+            fig.suptitle(f"Difference between Progressive and Random input complexity")
+            ax1.set_ylabel("Words learned (relative difference)")
+            ax2.plot(x, accuracy)
+            ax2.set_ylabel("Accuracy (relative difference)")
+            
+        plt.savefig(f"results/{time.time()}{self.name}.png")
+        plt.show()
     
     def show_translations(self):
-        translation_pairs = [(source_word, *self.get_most_likely_translation_bayes(source_word)) for source_word in self.data.source_unique_words]
+        translation_pairs = [(source_word, *self.get_most_likely_translation(source_word)) for source_word in self.source_unique_words]
         translation_pairs.sort(key=lambda x: x[2], reverse=False)
 
         for source_word, target_word, confidence in translation_pairs:
@@ -169,10 +178,13 @@ class CrossSituationalModel:
     
 
 
-# model_p = CrossSituationalModel("Progressive Input Complexity", BilingualDataset(shuffled=False))
-# model_p.train()
-# model_p.plot_results()
+model_p = CrossSituationalModel("Progressive Input Complexity", BilingualDataset(shuffled=False))
+model_p.train()
 
 model_r = CrossSituationalModel("Random Input Complexity", BilingualDataset(shuffled=True))
 model_r.train()
+
+model_p.plot_results()
 model_r.plot_results()
+
+model_p.plot_results(model_r.results)
