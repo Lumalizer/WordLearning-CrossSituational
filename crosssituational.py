@@ -5,6 +5,7 @@ from copy import deepcopy
 import os
 import numpy as np
 from word2word import Word2word
+import matplotlib.pyplot as plt
 
 @dataclass
 class BilingualDataset:
@@ -20,7 +21,7 @@ class BilingualDataset:
 
 class CrossSituationalModel:
     @staticmethod
-    def get_datasets(filename: str):
+    def get_datasets(filename: str, shuffled: bool = False):
         with open(filename, 'r', encoding="utf-8") as f:
             lines = [line.split('\t')[:2] for line in f.readlines()]
 
@@ -32,12 +33,16 @@ class CrossSituationalModel:
         train_lines = [lines[i] for i in range(len(lines)) if i not in test_indices]
         test_lines = [lines[i] for i in test_indices]
 
+        if shuffled:
+            random.shuffle(train_lines)
+
         return BilingualDataset(train_lines), BilingualDataset(test_lines)
 
-    def __init__(self, filename: str = "data/nld.txt"):
+    def __init__(self, name, filename: str = "data/nld.txt", shuffled: bool = False):
+        self.name = name
         self.en2nl = Word2word("en", "nl")
 
-        self.train_data, self.test_data = self.get_datasets(filename)
+        self.train_data, self.test_data = self.get_datasets(filename, shuffled)
 
         self.source_word_counts = defaultdict(int)
         self.target_word_counts = defaultdict(int)
@@ -92,34 +97,33 @@ class CrossSituationalModel:
         target_words = list(self.table[source_word].keys())
         smooth = 1
 
-        prior_probabilities = [(self.table[source_word][word] + smooth) / (self.target_word_counts[word] + smooth * len(target_words)) for word in target_words]
+        priors = [(self.table[source_word][word] + smooth) / (self.target_word_counts[word] + smooth * len(target_words)) for word in target_words]
         likelihoods = [(self.table[source_word][word] + smooth) / (self.target_word_counts[word] + smooth * len(target_words)) for word in target_words]
 
         # normalize
         likelihoods = [likelihood / sum(likelihoods) for likelihood in likelihoods]
-        prior_probabilities = [prior / sum(prior_probabilities) for prior in prior_probabilities]
+        priors = [prior / sum(priors) for prior in priors]
 
-        posteriors = [(likelihood * prior) / sum(np.array(likelihoods) * np.array(prior_probabilities)) for likelihood, prior in zip(likelihoods, prior_probabilities)]
+        posteriors = [(likelihood * prior) / sum(np.array(likelihoods) * np.array(priors)) for likelihood, prior in zip(likelihoods, priors)]
         max_index = posteriors.index(max(posteriors))
         return target_words[max_index], posteriors[max_index]
 
     def train(self):
-        length = len(self.train_data)
+        results = []
 
         for i, pair in enumerate(self.train_data):
             self.process_sentence_pair(pair)
 
-            if i % (length // 100) == 0:
-                print(f"Training performance: {self.test()}") 
+            if i % (len(self.train_data) // 100) == 0:
+                test_acc = self.test()
+                results.append((i, test_acc))
+                print(f"Test performance (i={i}): {test_acc}") 
 
-        print(self.test())
+        self.test_results = results
+        return results
 
     def test(self):
-        source_word_counts = deepcopy(self.source_word_counts)
-        target_word_counts = deepcopy(self.target_word_counts)
-        table = deepcopy(self.table)
-        source_unique_words = deepcopy(self.source_unique_words)
-        target_unique_words = deepcopy(self.target_unique_words)
+        self.prepare_enter_test()
 
         test_unique_source_words = set()
 
@@ -131,16 +135,24 @@ class CrossSituationalModel:
             self.process_sentence_pair(pair)
 
         translation_pairs = [(source_word, *self.get_most_likely_translation_bayes(source_word)) for source_word in test_unique_source_words]
-
         results = self.evaluate_accuracy(translation_pairs)
 
-        self.source_word_counts = source_word_counts
-        self.target_word_counts = target_word_counts
-        self.table = table
-        self.source_unique_words = source_unique_words
-        self.target_unique_words = target_unique_words
-
+        self.cleanup_after_test()
         return results
+
+    def prepare_enter_test(self):
+        self.source_word_counts_ = deepcopy(self.source_word_counts)
+        self.target_word_counts_ = deepcopy(self.target_word_counts)
+        self.table_ = deepcopy(self.table)
+        self.source_unique_words_ = deepcopy(self.source_unique_words)
+        self.target_unique_words_ = deepcopy(self.target_unique_words)
+
+    def cleanup_after_test(self):
+        self.source_word_counts = self.source_word_counts_
+        self.target_word_counts = self.target_word_counts_
+        self.table = self.table_
+        self.source_unique_words = self.source_unique_words_
+        self.target_unique_words = self.target_unique_words_
 
     def evaluate_accuracy(self, translation_pairs: list[tuple[str, str, int]]):
         correct = 0
@@ -166,6 +178,14 @@ class CrossSituationalModel:
             return 0
 
         return correct / (len(translation_pairs) - len(missing))
+    
+    def plot_results(self):
+        x, y = zip(*self.test_results)
+        plt.plot(x, y)
+        plt.title(f"Test performance over time ({self.name})")
+        plt.xlabel("Number of training examples")
+        plt.ylabel("Test performance")
+        plt.show()
 
     
     def show_translations(self):
@@ -177,5 +197,10 @@ class CrossSituationalModel:
     
 
 
-model = CrossSituationalModel()
-model.train()
+model_p = CrossSituationalModel("Progressive Input Complexity")
+model_p.train()
+model_p.plot_results()
+
+model_r = CrossSituationalModel("Random Input Complexity", shuffled=True)
+model_r.train()
+model_r.plot_results()
