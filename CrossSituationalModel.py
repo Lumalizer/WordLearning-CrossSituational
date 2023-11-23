@@ -1,56 +1,11 @@
 from collections import defaultdict
-from dataclasses import dataclass
-import random
 import time
 import numpy as np
+from BilingualDataset import BilingualDataset
 from word2word import Word2word
 import matplotlib.pyplot as plt
 import tqdm
 import os
-
-@dataclass
-class BilingualDataset:
-    filename: str = "data/nld.txt"
-    percentage: int = 100
-
-    def __post_init__(self):
-        with open(self.filename, 'r', encoding="utf-8") as f:
-            self.lines = [line.split('\t')[:2] for line in f.readlines()]
-
-        self.lines = [(self.preprocess(line[0]), self.preprocess(line[1])) for line in self.lines]
-        self.lines = random.sample(self.lines, (len(self.lines) // 100)*self.percentage)
-        self.lines.sort(key=lambda x: len(x[0].split()))
-
-        random.seed(42)
-
-        self.source_words_total = sum([len(line[0].split()) for line in self.lines])
-        self.target_words_total = sum([len(line[1].split()) for line in self.lines])
-        self.source_unique_words = set([word for line in self.lines for word in line[0].split()])
-        self.target_unique_words = set([word for line in self.lines for word in line[1].split()])
-
-        self.test_words_subset = random.sample(list(self.source_unique_words), len(self.source_unique_words) // 10)
-
-        print(self)
-
-    def shuffle_dataset(self):
-        random.shuffle(self.lines)
-
-    def __iter__(self):
-        for line in self.lines:
-            yield line[0], line[1]
-
-    def __len__(self):
-        return len(self.lines)
-    
-    def __repr__(self):
-        # show some statistics about the dataset
-        return f"Dataset with {len(self.lines)} sentence pairs, \n{len(self.source_unique_words)} unique source words, {self.source_words_total} total source words, \n{len(self.target_unique_words)} unique target words and {self.target_words_total} total target words."
-    
-    def preprocess(self, text: str):
-        for char in [",", ".", "?", "!", '"']:
-            text = text.replace(char, "")
-        return text.replace("'", " ").lower()
-
 
 class CrossSituationalModel:
     def __init__(self, name, data: BilingualDataset, interval_method="uniquewords"):
@@ -103,6 +58,7 @@ class CrossSituationalModel:
     def train(self):
         results = [(0, 0, 0)]
         processed = 0
+        total_processed = 0
         interval_method = self.interval_method
 
         if interval_method == "totalwords":
@@ -114,6 +70,7 @@ class CrossSituationalModel:
         for i, pair in tqdm.tqdm(enumerate(self.data), total=len(self.data)):
             if interval_method == "totalwords":
                 processed += len(pair[0].split())
+                total_processed += len(pair[0].split())
             elif interval_method == "uniquewords":
                 processed += len ([word for word in set(pair[0].split()) if word not in self.source_unique_words])
 
@@ -123,11 +80,15 @@ class CrossSituationalModel:
                 continue
 
             evaluation_results = self.test()
-            results.append((i if interval_method == "totalwords" else len(self.source_unique_words), *evaluation_results))
+            results.append((total_processed if interval_method == "totalwords" else len(self.source_unique_words), *evaluation_results))
             tqdm.tqdm.write(f"Test performance (pairs processed={i}): {evaluation_results}") 
             processed -= len_interval
 
         self.results = results
+
+        with open(f"results/{time.time()}{self.name}.txt", 'w') as f:
+            f.write(str(results))
+
         print(len(results))
         return results
 
@@ -163,8 +124,9 @@ class CrossSituationalModel:
         x, words_learned, accuracy = zip(*self.results)
 
         plt.style.use('ggplot')
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
-        fig.tight_layout(pad=3.3)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(5, 7))
+        # fig.tight_layout(pad=2.3)
+        fig.subplots_adjust(left=0.2)
         ax1: plt.Axes
         ax2: plt.Axes
         ax2.set_xlabel(f'{"Unique words" if self.interval_method == "uniquewords" else "Total words"} processed')
@@ -185,8 +147,8 @@ class CrossSituationalModel:
                 words_learned = np.array(words_learned) / np.array(words_learned_)
                 accuracy = np.array(accuracy) - np.array(accuracy_)
                 fig.suptitle(f"{self.name} vs {other_model.name} Input Complexity (difference)")
-                ax1.set_ylabel(f"Unique words learned ({self.name} / {other_model.name})")
-                ax2.set_ylabel(f"Accuracy ({self.name} - {other_model.name})")
+                ax1.set_ylabel(f"Unique words learned\n({self.name} / {other_model.name})")
+                ax2.set_ylabel(f"Accuracy\n({self.name} - {other_model.name})")
             else:
                 fig.suptitle(f"{self.name} vs {other_model.name} Input Complexity")
                 ax1.set_ylabel("Unique words learned")
@@ -210,20 +172,3 @@ class CrossSituationalModel:
 
         for source_word, target_word, confidence in translation_pairs:
             print(f"[ {source_word} ► {target_word} ] (confidence: {confidence})")
-    
-
-def run_models(interval_method):
-    dataset = BilingualDataset(percentage=100)
-    model_p = CrossSituationalModel("Progressive", dataset, interval_method)
-    model_p.train()
-
-    dataset.shuffle_dataset()
-
-    model_r = CrossSituationalModel("Random", dataset, interval_method)
-    model_r.train()
-
-    model_p.plot_results(model_r)
-    model_p.plot_results(model_r, difference=True)
-
-run_models("uniquewords")
-run_models("totalwords")
