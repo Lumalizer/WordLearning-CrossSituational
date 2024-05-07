@@ -4,7 +4,7 @@ colorama==0.4.6
 contourpy==1.2.0
 cycler==0.12.1
 fonttools==4.45.1
-idna==3.4
+idna==3.7
 kiwisolver==1.4.5
 matplotlib==3.8.2
 numpy==1.26.2
